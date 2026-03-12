@@ -414,7 +414,7 @@ class WifiCore:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 批量尝试线程
+# 批量尝试线程（支持全量遍历阶段）
 # ─────────────────────────────────────────────────────────────────────────────
 class WifiConnectThread(QThread):
     status_signal   = pyqtSignal(str, str)
@@ -424,12 +424,17 @@ class WifiConnectThread(QThread):
     trying_signal   = pyqtSignal(str)
     result_signal   = pyqtSignal(str, bool)
 
-    def __init__(self, ssid, high, low):
+    def __init__(self, ssid, high, low, charset, lengths, sample, use_d, use_l):
         super().__init__()
-        self.ssid  = ssid
-        self.high  = high
-        self.low   = low
-        self._stop = [False]
+        self.ssid    = ssid
+        self.high    = high
+        self.low     = low
+        self.charset = charset
+        self.lengths = lengths
+        self.sample  = sample
+        self.use_d   = use_d
+        self.use_l   = use_l
+        self._stop   = [False]
 
     def stop(self):
         self._stop[0] = True
@@ -443,18 +448,20 @@ class WifiConnectThread(QThread):
         return lvl
 
     def run(self):
-        total = len(self.high) + len(self.low)
-        t0    = time.time()
+        total_known = len(self.high) + len(self.low)
+        t0          = time.time()
 
+        # ========== 阶段一：高频候选 ==========
         self.phase_signal.emit("🔥 阶段一：正在尝试高频字符组合候选密码...")
         for i, pwd in enumerate(self.high):
             if self._stop[0]:
                 self.status_signal.emit("❌ 用户中止尝试", "error")
                 return
-            if self._attempt(pwd, i + 1, total, t0) == "success":
+            if self._attempt(pwd, i + 1, total_known, t0) == "success":
                 self.success_signal.emit(pwd)
                 return
 
+        # ========== 阶段二：低频候选 ==========
         self.status_signal.emit("─" * 56, "info")
         self.status_signal.emit("⚠️  高频候选密码已全部尝试，未找到匹配密码。", "warn")
         self.status_signal.emit("⏩  进入阶段二：尝试低频 / 扩展字符候选密码...", "warn")
@@ -466,12 +473,42 @@ class WifiConnectThread(QThread):
             if self._stop[0]:
                 self.status_signal.emit("❌ 用户中止尝试", "error")
                 return
-            if self._attempt(pwd, offset + i + 1, total, t0) == "success":
+            if self._attempt(pwd, offset + i + 1, total_known, t0) == "success":
                 self.success_signal.emit(pwd)
                 return
 
+        # ========== 阶段三：全量遍历（新增） ==========
         self.status_signal.emit("─" * 56, "info")
-        self.status_signal.emit("🔚 所有候选密码已尝试完毕，未找到匹配密码。", "warn")
+        self.status_signal.emit("🌌 进入阶段三：全量遍历所有可能密码组合...", "warn")
+        self.status_signal.emit("   （将基于您选择的字符集与长度，穷举所有可能性，可能耗时较长）", "info")
+        self.phase_signal.emit("🌌 阶段三：全量遍历所有可能密码（基于选定字符集与长度）...")
+
+        # 创建全量生成器（基于完整字符集）
+        gen_all = PasswordCandidateGenerator(self.charset, self.lengths,
+                                            self.sample, self.use_d, self.use_l)
+        # 已尝试过的集合（阶段1+阶段2），避免重复尝试
+        attempted = set(self.high) | set(self.low)
+
+        count_stage3 = 0
+        for pwd in gen_all.generate_all():
+            if self._stop[0]:
+                self.status_signal.emit("❌ 用户中止尝试", "error")
+                return
+
+            # 跳过已在阶段一、二尝试过的密码
+            if pwd in attempted:
+                continue
+
+            count_stage3 += 1
+            cur_total = total_known + count_stage3
+            # total 传 -1 表示“无限/未知总数”，UI 会显示 “当前计数 / ∞”
+            if self._attempt(pwd, cur_total, -1, t0) == "success":
+                self.success_signal.emit(pwd)
+                return
+
+        # 全部尝试完仍未成功
+        self.status_signal.emit("─" * 56, "info")
+        self.status_signal.emit("🔚 所有可能密码已尝试完毕，未找到匹配密码。", "warn")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -500,13 +537,14 @@ class DirectConnectThread(QThread):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 密码候选生成器
+# 密码候选生成器（新增 generate_all 方法用于全量遍历）
 # ─────────────────────────────────────────────────────────────────────────────
 class PasswordCandidateGenerator:
     def __init__(self, charset, lengths, sample, use_digits, use_letters):
         self.lengths     = lengths
         self.use_digits  = use_digits
         self.use_letters = use_letters
+        self.charset     = charset               # 保存完整字符集，供全量遍历使用
         freq             = Counter(sample)
         self.high_chars  = [c for c, _ in freq.most_common() if c in charset]
         high_set         = set(self.high_chars)
@@ -546,6 +584,15 @@ class PasswordCandidateGenerator:
         high = _build(self.high_chars, max_high)
         low  = _build(self.low_chars,  max_low) if self.low_chars else []
         return high, low
+
+    def generate_all(self):
+        """
+        生成所有可能的密码组合（基于 self.charset 与 self.lengths）。
+        使用生成器（yield），避免一次性占用过多内存。
+        """
+        for n in self.lengths:
+            for combo in product(self.charset, repeat=n):
+                yield "".join(combo)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -920,7 +967,8 @@ class WifiToolWindow(QWidget):
             "  3. 填写样本密码，选择密码位数、字符集及排除选项",
             "  4. 密码框右侧实时显示当前尝试密码及成败指示（✕红色闪烁 / ✔绿色）",
             "  5. 进度条下方实时显示已用时与预计剩余时间（ETA）",
-            "  6. 连接成功时将自动播放提示音并弹出通知", "",
+            "  6. 连接成功时将自动播放提示音并弹出通知",
+            "  7. 全量遍历阶段会尝试所有可能组合，可能耗时较长，可随时点击“停止尝试”中断", "",
         ]:
             self._log(t, "info")
 
@@ -1034,7 +1082,7 @@ class WifiToolWindow(QWidget):
         done    = self._attempt_done
         total   = self._attempt_total
         self.elapsed_lbl.setText(f"⏱ 已用时：{self._fmt_sec(elapsed)}")
-        if done > 0 and total > 0:
+        if done > 0 and total > 0 and total != -1:
             remain = (total - done) * (elapsed / done)
             self.eta_lbl.setText(f"ETA：{self._fmt_sec(remain)}")
         else:
@@ -1129,13 +1177,13 @@ class WifiToolWindow(QWidget):
             w.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
-        total = len(high) + len(low)
-        self._attempt_total = total
+        total_known = len(high) + len(low)
+        self._attempt_total = total_known
         self._attempt_done  = 0
         self._attempt_start = time.time()
 
         self.progress.setVisible(True)
-        self.progress.setMaximum(total)
+        self.progress.setMaximum(total_known if total_known > 0 else 0)
         self.progress.setValue(0)
         self.progress.setFormat("%p%  （%v / %m）")
         self.elapsed_lbl.setText("⏱ 已用时：0s")
@@ -1143,7 +1191,10 @@ class WifiToolWindow(QWidget):
         self._elapsed_timer.start(1000)
         self.flash_lbl.clear_display()
 
-        self.connect_thread = WifiConnectThread(ssid, high, low)
+        # 传递全量遍历所需参数（charset, lengths, sample, use_d, use_l）
+        self.connect_thread = WifiConnectThread(
+            ssid, high, low, charset, lengths, sample, use_d, use_l
+        )
         self.connect_thread.status_signal.connect(lambda m, l: self._log(m, l))
         self.connect_thread.progress_signal.connect(self._on_progress)
         self.connect_thread.phase_signal.connect(self.phase_lbl.setText)
@@ -1152,7 +1203,7 @@ class WifiToolWindow(QWidget):
         self.connect_thread.result_signal.connect(self._on_result)
         self.connect_thread.finished.connect(self._on_finished)
         self.connect_thread.start()
-        self.status_lbl.setText(f"0 / {total}")
+        self.status_lbl.setText(f"0 / {total_known}")
 
     def _on_result(self, pwd: str, success: bool):
         if success:
@@ -1168,11 +1219,20 @@ class WifiToolWindow(QWidget):
     def _on_progress(self, cur: int, total: int, elapsed: float):
         self._attempt_done  = cur
         self._attempt_total = total
-        self.progress.setMaximum(total)
-        self.progress.setValue(cur)
-        pct = int(cur / total * 100) if total else 0
-        self.progress.setFormat(f"{pct}%  （{cur} / {total}）")
-        self.status_lbl.setText(f"{cur} / {total}")
+        if total > 0:
+            # 正常模式（阶段一、二）
+            self.progress.setMaximum(total)
+            self.progress.setValue(cur)
+            pct = int(cur / total * 100)
+            self.progress.setFormat(f"{pct}%  （{cur} / {total}）")
+            self.status_lbl.setText(f"{cur} / {total}")
+        else:
+            # total <= 0 表示无限/全量遍历模式（阶段三）
+            # 显示 “当前计数 / ∞”，进度条保持增长或循环动画
+            self.progress.setMaximum(0)  # 0 表示 busy indicator（Qt 会来回走）或可设大数值
+            # 这里我们选择显示文本 “已尝试: X  (全量模式)”
+            self.progress.setFormat(f"已尝试: {cur}  (全量模式)")
+            self.status_lbl.setText(f"{cur} / ∞")
 
     def _on_finished(self):
         self._elapsed_timer.stop()
