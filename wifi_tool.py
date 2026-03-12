@@ -27,7 +27,7 @@ _HIDE_CONSOLE.wShowWindow = subprocess.SW_HIDE
 
 _SUBPROCESS_KW = dict(
     startupinfo   = _HIDE_CONSOLE,
-    creationflags = subprocess.CREATE_NO_WINDOW,   # 双重保险
+    creationflags = subprocess.CREATE_NO_WINDOW,
     capture_output = True,
     encoding       = "gbk",
     errors         = "ignore",
@@ -35,7 +35,6 @@ _SUBPROCESS_KW = dict(
 
 
 def _run(args: list, timeout: int = 20) -> str:
-    """统一执行子进程，完全无控制台窗口"""
     try:
         return subprocess.run(args, timeout=timeout, **_SUBPROCESS_KW).stdout
     except Exception:
@@ -81,7 +80,7 @@ _TIP_AMB = (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 生成程序图标（运行时绘制，无需外部文件）
+# 生成程序图标
 # ─────────────────────────────────────────────────────────────────────────────
 def _generate_app_icon() -> QIcon:
     sizes = [16, 32, 48, 64, 128, 256]
@@ -356,7 +355,7 @@ class FlashLabel(QLabel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WiFi 连接核心（使用统一 _run，无控制台窗口）
+# WiFi 连接核心
 # ─────────────────────────────────────────────────────────────────────────────
 class WifiCore:
     @staticmethod
@@ -393,7 +392,6 @@ class WifiCore:
             _run(["netsh", "wlan", "add", "profile",
                   f"filename={temp}", "user=all"])
             _run(["netsh", "wlan", "connect", f"name={ssid}"])
-
             time.sleep(0.8)
             for _ in range(16):
                 if stop_flag_ref[0]:
@@ -414,101 +412,173 @@ class WifiCore:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 批量尝试线程（支持全量遍历阶段）
+# 密码候选生成器  ← 重点修改
+# ─────────────────────────────────────────────────────────────────────────────
+class PasswordCandidateGenerator:
+    """
+    两阶段策略：
+      阶段一  generate_high()         — 按样本字符频率排序，优先尝试最可能的组合
+      阶段二  generate_all_iter()     — 懒加载生成器，遍历字符集×长度的完整笛卡尔积，
+                                        跳过阶段一已尝试的密码，确保不遗漏任何可能性
+    """
+
+    def __init__(self, charset: str, lengths: list[int],
+                 sample: str, use_digits: bool, use_letters: bool):
+        self.charset     = charset          # 完整字符集（有序字符串）
+        self.lengths     = lengths
+        self.use_digits  = use_digits
+        self.use_letters = use_letters
+        freq             = Counter(sample)
+        # 按频率降序排列，仅保留在字符集内的字符
+        self.high_chars  = [c for c, _ in freq.most_common() if c in charset]
+        high_set         = set(self.high_chars)
+        self.low_chars   = [c for c in charset if c not in high_set]
+
+    # ── 工具 ──────────────────────────────────────────────────────────────────
+    def total_count(self) -> int:
+        """字符集 × 所有选定长度的完整组合总数"""
+        return sum(len(self.charset) ** n for n in self.lengths)
+
+    @staticmethod
+    def _fmt_big(n: int) -> str:
+        """将超大整数格式化为易读字符串，如 '1.23×10¹⁵'"""
+        if n < 1_000_000:
+            return f"{n:,}"
+        exp   = len(str(n)) - 1
+        coeff = n / (10 ** exp)
+        sup   = str(exp).translate(
+            str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+        )
+        return f"{coeff:.2f}×10{sup}"
+
+    @staticmethod
+    def _gen_list(chars: list, lengths: list[int], limit: int) -> list[str]:
+        out = []
+        for n in lengths:
+            if len(out) >= limit:
+                break
+            for combo in product(chars, repeat=n):
+                out.append("".join(combo))
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _subsets(self, chars: list) -> list[list]:
+        digits  = [c for c in chars if c.isdigit()]
+        letters = [c for c in chars if c.isalpha()]
+        subsets = []
+        if self.use_digits  and digits:                subsets.append(digits)
+        if self.use_letters and letters:               subsets.append(letters)
+        if self.use_digits and self.use_letters \
+                and digits and letters:                subsets.append(list(chars))
+        if not subsets:                                subsets.append(list(chars))
+        return subsets
+
+    # ── 阶段一：高频优先候选列表 ───────────────────────────────────────────────
+    def generate_high(self, max_high: int = 500) -> list[str]:
+        """
+        根据样本字符频率生成高优先级候选列表。
+        先尝试纯数字/纯字母子集，再尝试混合集，去重后截取前 max_high 条。
+        """
+        subs = self._subsets(self.high_chars)
+        per  = max(1, max_high // len(subs))
+        buf  = []
+        for s in subs:
+            buf += self._gen_list(s, self.lengths, per)
+        return list(dict.fromkeys(buf))[:max_high]
+
+    # ── 阶段二：全量遍历生成器（懒加载，不占用内存）───────────────────────────
+    def generate_all_iter(self, skip_set: set):
+        """
+        懒加载生成器：按 lengths 从小到大，对完整字符集做笛卡尔积遍历，
+        跳过 skip_set 中已尝试过的密码，保证最终遍历所有可能性。
+        """
+        for n in self.lengths:
+            for combo in product(self.charset, repeat=n):
+                pwd = "".join(combo)
+                if pwd not in skip_set:
+                    yield pwd
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 批量尝试线程  ← 重点修改
 # ─────────────────────────────────────────────────────────────────────────────
 class WifiConnectThread(QThread):
     status_signal   = pyqtSignal(str, str)
-    progress_signal = pyqtSignal(int, int, float)
+    progress_signal = pyqtSignal(int, int, float)   # (cur, total, elapsed)
     phase_signal    = pyqtSignal(str)
     success_signal  = pyqtSignal(str)
     trying_signal   = pyqtSignal(str)
     result_signal   = pyqtSignal(str, bool)
 
-    def __init__(self, ssid, high, low, charset, lengths, sample, use_d, use_l):
+    def __init__(self, ssid: str,
+                 high: list[str],
+                 all_gen,           # generate_all_iter() 生成器
+                 total: int):       # 完整组合总数（用于进度显示）
         super().__init__()
         self.ssid    = ssid
         self.high    = high
-        self.low     = low
-        self.charset = charset
-        self.lengths = lengths
-        self.sample  = sample
-        self.use_d   = use_d
-        self.use_l   = use_l
+        self.all_gen = all_gen
+        self.total   = total
         self._stop   = [False]
 
     def stop(self):
         self._stop[0] = True
 
-    def _attempt(self, pwd, cur, total, t0):
+    # ── 单次尝试 ──────────────────────────────────────────────────────────────
+    def _attempt(self, pwd: str, cur: int, t0: float) -> str:
         self.trying_signal.emit(pwd)
         msg, lvl = WifiCore.try_connect(self.ssid, pwd, self._stop)
         self.result_signal.emit(pwd, lvl == "success")
         self.status_signal.emit(msg, lvl)
-        self.progress_signal.emit(cur, total, time.time() - t0)
+        self.progress_signal.emit(cur, self.total, time.time() - t0)
         return lvl
 
+    # ── 主流程 ────────────────────────────────────────────────────────────────
     def run(self):
-        total_known = len(self.high) + len(self.low)
-        t0          = time.time()
+        t0  = time.time()
+        cur = 0
 
-        # ========== 阶段一：高频候选 ==========
-        self.phase_signal.emit("🔥 阶段一：正在尝试高频字符组合候选密码...")
-        for i, pwd in enumerate(self.high):
+        # ── 阶段一：高频优先 ──────────────────────────────────────────────────
+        self.phase_signal.emit(
+            f"🔥 阶段一：正在尝试高频字符组合候选密码（共 {len(self.high):,} 条）..."
+        )
+        for pwd in self.high:
             if self._stop[0]:
                 self.status_signal.emit("❌ 用户中止尝试", "error")
                 return
-            if self._attempt(pwd, i + 1, total_known, t0) == "success":
+            cur += 1
+            if self._attempt(pwd, cur, t0) == "success":
                 self.success_signal.emit(pwd)
                 return
 
-        # ========== 阶段二：低频候选 ==========
         self.status_signal.emit("─" * 56, "info")
-        self.status_signal.emit("⚠️  高频候选密码已全部尝试，未找到匹配密码。", "warn")
-        self.status_signal.emit("⏩  进入阶段二：尝试低频 / 扩展字符候选密码...", "warn")
+        self.status_signal.emit(
+            "⚠️  高频候选密码已全部尝试，未找到匹配密码。", "warn"
+        )
+        self.status_signal.emit(
+            "⏩  进入阶段二：暴力遍历全部剩余组合...", "warn"
+        )
         self.status_signal.emit("─" * 56, "info")
 
-        offset = len(self.high)
-        self.phase_signal.emit("🧊 阶段二：正在尝试低频 / 扩展字符组合候选密码...")
-        for i, pwd in enumerate(self.low):
+        # ── 阶段二：全量暴力遍历（生成器，懒加载）────────────────────────────
+        remaining = self.total - len(self.high)
+        self.phase_signal.emit(
+            f"🧊 阶段二：暴力遍历全部剩余候选密码（约 {PasswordCandidateGenerator._fmt_big(remaining)} 条）..."
+        )
+        for pwd in self.all_gen:
             if self._stop[0]:
                 self.status_signal.emit("❌ 用户中止尝试", "error")
                 return
-            if self._attempt(pwd, offset + i + 1, total_known, t0) == "success":
+            cur += 1
+            if self._attempt(pwd, cur, t0) == "success":
                 self.success_signal.emit(pwd)
                 return
 
-        # ========== 阶段三：全量遍历（新增） ==========
         self.status_signal.emit("─" * 56, "info")
-        self.status_signal.emit("🌌 进入阶段三：全量遍历所有可能密码组合...", "warn")
-        self.status_signal.emit("   （将基于您选择的字符集与长度，穷举所有可能性，可能耗时较长）", "info")
-        self.phase_signal.emit("🌌 阶段三：全量遍历所有可能密码（基于选定字符集与长度）...")
-
-        # 创建全量生成器（基于完整字符集）
-        gen_all = PasswordCandidateGenerator(self.charset, self.lengths,
-                                            self.sample, self.use_d, self.use_l)
-        # 已尝试过的集合（阶段1+阶段2），避免重复尝试
-        attempted = set(self.high) | set(self.low)
-
-        count_stage3 = 0
-        for pwd in gen_all.generate_all():
-            if self._stop[0]:
-                self.status_signal.emit("❌ 用户中止尝试", "error")
-                return
-
-            # 跳过已在阶段一、二尝试过的密码
-            if pwd in attempted:
-                continue
-
-            count_stage3 += 1
-            cur_total = total_known + count_stage3
-            # total 传 -1 表示“无限/未知总数”，UI 会显示 “当前计数 / ∞”
-            if self._attempt(pwd, cur_total, -1, t0) == "success":
-                self.success_signal.emit(pwd)
-                return
-
-        # 全部尝试完仍未成功
-        self.status_signal.emit("─" * 56, "info")
-        self.status_signal.emit("🔚 所有可能密码已尝试完毕，未找到匹配密码。", "warn")
+        self.status_signal.emit(
+            "🔚 所有候选密码已遍历完毕，未找到匹配密码。", "warn"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -534,65 +604,6 @@ class DirectConnectThread(QThread):
         if lvl == "success":
             self._ok = True
             self.success_signal.emit(self.password)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 密码候选生成器（新增 generate_all 方法用于全量遍历）
-# ─────────────────────────────────────────────────────────────────────────────
-class PasswordCandidateGenerator:
-    def __init__(self, charset, lengths, sample, use_digits, use_letters):
-        self.lengths     = lengths
-        self.use_digits  = use_digits
-        self.use_letters = use_letters
-        self.charset     = charset               # 保存完整字符集，供全量遍历使用
-        freq             = Counter(sample)
-        self.high_chars  = [c for c, _ in freq.most_common() if c in charset]
-        high_set         = set(self.high_chars)
-        self.low_chars   = [c for c in charset if c not in high_set]
-
-    @staticmethod
-    def _gen(chars, lengths, limit):
-        out = []
-        for n in lengths:
-            if len(out) >= limit:
-                break
-            for combo in product(chars, repeat=n):
-                out.append("".join(combo))
-                if len(out) >= limit:
-                    break
-        return out
-
-    def _subsets(self, chars):
-        digits  = [c for c in chars if c.isdigit()]
-        letters = [c for c in chars if c.isalpha()]
-        subsets = []
-        if self.use_digits  and digits:                 subsets.append(digits)
-        if self.use_letters and letters:                subsets.append(letters)
-        if self.use_digits and self.use_letters \
-                and digits and letters:                 subsets.append(chars)
-        if not subsets:                                 subsets.append(chars)
-        return subsets
-
-    def generate(self, max_high=300, max_low=300):
-        def _build(chars, limit):
-            subs = self._subsets(chars)
-            per  = max(1, limit // len(subs))
-            buf  = []
-            for s in subs:
-                buf += self._gen(s, self.lengths, per)
-            return list(dict.fromkeys(buf))[:limit]
-        high = _build(self.high_chars, max_high)
-        low  = _build(self.low_chars,  max_low) if self.low_chars else []
-        return high, low
-
-    def generate_all(self):
-        """
-        生成所有可能的密码组合（基于 self.charset 与 self.lengths）。
-        使用生成器（yield），避免一次性占用过多内存。
-        """
-        for n in self.lengths:
-            for combo in product(self.charset, repeat=n):
-                yield "".join(combo)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -782,7 +793,6 @@ class WifiToolWindow(QWidget):
         root.setContentsMargins(22, 16, 22, 16)
         root.setSpacing(12)
 
-        # 标题行
         hdr = QHBoxLayout()
         ico = QLabel("🔐"); ico.setStyleSheet("font-size:23px;")
         ttl = QLabel("WiFi 安全审计工具")
@@ -800,12 +810,10 @@ class WifiToolWindow(QWidget):
         sp.setChildrenCollapsible(False)
         sp.setHandleWidth(8)
 
-        # ══ 配置区 ════════════════════════════════════════════════════════════
         cfg_w = QWidget(); cfg_w.setStyleSheet("background:transparent;")
         cfg_l = QVBoxLayout(cfg_w)
         cfg_l.setContentsMargins(0, 0, 0, 0); cfg_l.setSpacing(10)
 
-        # Group 1 ── 连接目标
         g1 = QGroupBox("  🎯  连接目标")
         g1_l = QVBoxLayout(g1); g1_l.setSpacing(10)
 
@@ -814,9 +822,7 @@ class WifiToolWindow(QWidget):
         self.ssid_combo = QComboBox()
         self.ssid_combo.setEditable(True)
         self.ssid_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.ssid_combo.lineEdit().setPlaceholderText(
-            "选择或输入 WiFi 名称（SSID）"
-        )
+        self.ssid_combo.lineEdit().setPlaceholderText("选择或输入 WiFi 名称（SSID）")
         self.ssid_combo.setCurrentText(DEFAULT_SSID)
         self.ssid_combo.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
@@ -847,7 +853,6 @@ class WifiToolWindow(QWidget):
         g1_l.addLayout(pwd_row)
         cfg_l.addWidget(g1)
 
-        # Group 2 ── 密码生成参数
         g2 = QGroupBox("  ⚙️  密码生成参数")
         r2 = QVBoxLayout(g2); r2.setSpacing(10)
         self.len_sel = MultiSelectComboLike("密码长度（位数）", list(range(8, 13)))
@@ -867,12 +872,8 @@ class WifiToolWindow(QWidget):
 
         ex_row = QHBoxLayout(); ex_row.setSpacing(16)
         lb_ex = QLabel("排除项："); lb_ex.setFixedWidth(58)
-        self.cb_excl_sim = _make_cb(
-            "✓ 排除相似字符", checked=False, tooltip=_TIP_SIM
-        )
-        self.cb_excl_amb = _make_cb(
-            "✓ 排除歧义符号", checked=False, tooltip=_TIP_AMB
-        )
+        self.cb_excl_sim = _make_cb("✓ 排除相似字符", checked=False, tooltip=_TIP_SIM)
+        self.cb_excl_amb = _make_cb("✓ 排除歧义符号", checked=False, tooltip=_TIP_AMB)
         ex_row.addWidget(lb_ex)
         ex_row.addWidget(self.cb_excl_sim)
         ex_row.addWidget(self.cb_excl_amb)
@@ -880,7 +881,6 @@ class WifiToolWindow(QWidget):
         r2.addLayout(ex_row)
         cfg_l.addWidget(g2)
 
-        # 按钮行
         btn_row = QHBoxLayout(); btn_row.setSpacing(10)
         self.btn_start  = self._btn("▶  开始尝试", "btn_start")
         self.btn_stop   = self._btn("⏹  停止尝试", "btn_stop")
@@ -898,14 +898,14 @@ class WifiToolWindow(QWidget):
         btn_row.addWidget(self.btn_clear)
         cfg_l.addLayout(btn_row)
 
-        # 进度条
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress.setFixedHeight(20)
-        self.progress.setFormat("%p%  （%v / %m）")
+        # 固定使用 0-10000 刻度（=百分比×100），防止超大总数溢出 Qt int
+        self.progress.setMaximum(10000)
+        self.progress.setValue(0)
         cfg_l.addWidget(self.progress)
 
-        # 计时行
         time_row = QHBoxLayout(); time_row.setSpacing(0)
         self.elapsed_lbl = QLabel("")
         self.elapsed_lbl.setStyleSheet(
@@ -921,7 +921,6 @@ class WifiToolWindow(QWidget):
         time_row.addWidget(self.eta_lbl)
         cfg_l.addLayout(time_row)
 
-        # 状态行
         st = QHBoxLayout()
         self.phase_lbl = QLabel("")
         self.phase_lbl.setStyleSheet(
@@ -936,14 +935,11 @@ class WifiToolWindow(QWidget):
         cfg_l.addLayout(st)
         sp.addWidget(cfg_w)
 
-        # ══ 日志区 ════════════════════════════════════════════════════════════
         log_w = QWidget(); log_w.setStyleSheet("background:transparent;")
         log_l = QVBoxLayout(log_w)
         log_l.setContentsMargins(0, 4, 0, 0); log_l.setSpacing(4)
         log_hdr = QLabel("📋  运行日志")
-        log_hdr.setStyleSheet(
-            "color:#6a8dff; font-size:13px; font-weight:600;"
-        )
+        log_hdr.setStyleSheet("color:#6a8dff; font-size:13px; font-weight:600;")
         log_l.addWidget(log_hdr)
         self.output = QTextEdit()
         self.output.setReadOnly(True)
@@ -965,10 +961,11 @@ class WifiToolWindow(QWidget):
             "  1. 从下拉框选择目标 WiFi，或手动输入 SSID",
             "  2. 点击「🔄 扫描WiFi」可随时刷新可用 WiFi 列表",
             "  3. 填写样本密码，选择密码位数、字符集及排除选项",
-            "  4. 密码框右侧实时显示当前尝试密码及成败指示（✕红色闪烁 / ✔绿色）",
-            "  5. 进度条下方实时显示已用时与预计剩余时间（ETA）",
-            "  6. 连接成功时将自动播放提示音并弹出通知",
-            "  7. 全量遍历阶段会尝试所有可能组合，可能耗时较长，可随时点击“停止尝试”中断", "",
+            "  4. 阶段一优先尝试按样本字符频率排序的高概率候选密码",
+            "  5. 阶段二自动遍历字符集×长度的全部组合，确保不遗漏任何可能性",
+            "  6. 密码框右侧实时显示当前尝试密码及成败指示（✕红色闪烁 / ✔绿色）",
+            "  7. 进度条下方实时显示已用时与预计剩余时间（ETA）",
+            "  8. 连接成功时将自动播放提示音并弹出通知", "",
         ]:
             self._log(t, "info")
 
@@ -1082,7 +1079,7 @@ class WifiToolWindow(QWidget):
         done    = self._attempt_done
         total   = self._attempt_total
         self.elapsed_lbl.setText(f"⏱ 已用时：{self._fmt_sec(elapsed)}")
-        if done > 0 and total > 0 and total != -1:
+        if done > 0 and total > 0:
             remain = (total - done) * (elapsed / done)
             self.eta_lbl.setText(f"ETA：{self._fmt_sec(remain)}")
         else:
@@ -1133,12 +1130,13 @@ class WifiToolWindow(QWidget):
             w.setEnabled(True)
         self.status_lbl.setText("就绪")
 
-    # ── 批量尝试 ──────────────────────────────────────────────────────────────
+    # ── 批量尝试  ← 重点修改 ──────────────────────────────────────────────────
     def start_attempt(self):
         ssid    = self._get_ssid()
         sample  = self.pwd_edit.text().strip()
         lengths = self.len_sel.selected_values()
         charset = self._charset()
+
         if not ssid:
             QMessageBox.warning(self, "提示", "WiFi 名称不能为空"); return
         if not sample:
@@ -1148,13 +1146,25 @@ class WifiToolWindow(QWidget):
         if not charset:
             QMessageBox.warning(self, "提示", "字符集为空，请检查选项"); return
 
-        use_d = self.cb_digit.isChecked()
-        use_l = self.cb_upper.isChecked() or self.cb_lower.isChecked()
-        gen   = PasswordCandidateGenerator(charset, lengths, sample, use_d, use_l)
-        high, low = gen.generate(max_high=300, max_low=300)
-        if not high and not low:
+        use_d   = self.cb_digit.isChecked()
+        use_l   = self.cb_upper.isChecked() or self.cb_lower.isChecked()
+        gen_obj = PasswordCandidateGenerator(charset, lengths, sample, use_d, use_l)
+
+        # 阶段一：高频优先候选列表
+        high  = gen_obj.generate_high(max_high=500)
+
+        # 完整组合总数（用于进度显示）
+        total = gen_obj.total_count()
+
+        # 阶段二：全量遍历生成器，跳过阶段一已尝试的密码
+        skip_set      = set(high)
+        remaining_gen = gen_obj.generate_all_iter(skip_set)
+
+        if not high and total == 0:
             QMessageBox.warning(self, "提示", "无法生成候选密码"); return
 
+        # ── 日志 ──────────────────────────────────────────────────────────────
+        total_str = PasswordCandidateGenerator._fmt_big(total)
         self._log("", "info"); sep = "═" * 66
         self._log(sep, "info")
         self._log(f"[开始尝试]  {time.strftime('%Y-%m-%d %H:%M:%S')}", "info")
@@ -1162,7 +1172,16 @@ class WifiToolWindow(QWidget):
         self._log(f"WiFi 名称：{ssid}", "info")
         self._log(f"样本密码：{sample}", "info")
         self._log(f"选择长度：{lengths}    字符集大小：{len(charset)}", "info")
-        self._log(f"高频候选数：{len(high)}    低频候选数：{len(low)}", "info")
+        self._log(
+            f"阶段一高频候选数：{len(high):,}    "
+            f"全量组合总数：{total_str}", "info"
+        )
+        # 超大数量预警
+        if total > 10_000_000:
+            self._log(
+                f"⚠️  全量总数为 {total_str}，暴力遍历可能耗时极长，"
+                "建议缩小字符集或密码长度范围。", "warn"
+            )
         self._log("", "info")
         self._log("字符频率分析（样本密码）：", "info")
         freq = Counter(sample)
@@ -1177,24 +1196,20 @@ class WifiToolWindow(QWidget):
             w.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
-        total_known = len(high) + len(low)
-        self._attempt_total = total_known
+        self._attempt_total = total
         self._attempt_done  = 0
         self._attempt_start = time.time()
 
         self.progress.setVisible(True)
-        self.progress.setMaximum(total_known if total_known > 0 else 0)
+        self.progress.setMaximum(10000)   # 固定刻度，防止超大总数溢出
         self.progress.setValue(0)
-        self.progress.setFormat("%p%  （%v / %m）")
+        self.progress.setFormat(f"0.00%  （0 / {total_str}）")
         self.elapsed_lbl.setText("⏱ 已用时：0s")
         self.eta_lbl.setText("ETA：计算中...")
         self._elapsed_timer.start(1000)
         self.flash_lbl.clear_display()
 
-        # 传递全量遍历所需参数（charset, lengths, sample, use_d, use_l）
-        self.connect_thread = WifiConnectThread(
-            ssid, high, low, charset, lengths, sample, use_d, use_l
-        )
+        self.connect_thread = WifiConnectThread(ssid, high, remaining_gen, total)
         self.connect_thread.status_signal.connect(lambda m, l: self._log(m, l))
         self.connect_thread.progress_signal.connect(self._on_progress)
         self.connect_thread.phase_signal.connect(self.phase_lbl.setText)
@@ -1203,7 +1218,9 @@ class WifiToolWindow(QWidget):
         self.connect_thread.result_signal.connect(self._on_result)
         self.connect_thread.finished.connect(self._on_finished)
         self.connect_thread.start()
-        self.status_lbl.setText(f"0 / {total_known}")
+        self.status_lbl.setText(
+            f"0 / {PasswordCandidateGenerator._fmt_big(total)}"
+        )
 
     def _on_result(self, pwd: str, success: bool):
         if success:
@@ -1216,30 +1233,30 @@ class WifiToolWindow(QWidget):
             self.connect_thread.stop()
             self.status_lbl.setText("正在停止...")
 
+    # ── 进度更新  ← 重点修改 ──────────────────────────────────────────────────
     def _on_progress(self, cur: int, total: int, elapsed: float):
         self._attempt_done  = cur
         self._attempt_total = total
-        if total > 0:
-            # 正常模式（阶段一、二）
-            self.progress.setMaximum(total)
-            self.progress.setValue(cur)
-            pct = int(cur / total * 100)
-            self.progress.setFormat(f"{pct}%  （{cur} / {total}）")
-            self.status_lbl.setText(f"{cur} / {total}")
-        else:
-            # total <= 0 表示无限/全量遍历模式（阶段三）
-            # 显示 “当前计数 / ∞”，进度条保持增长或循环动画
-            self.progress.setMaximum(0)  # 0 表示 busy indicator（Qt 会来回走）或可设大数值
-            # 这里我们选择显示文本 “已尝试: X  (全量模式)”
-            self.progress.setFormat(f"已尝试: {cur}  (全量模式)")
-            self.status_lbl.setText(f"{cur} / ∞")
+        # 将进度映射到 0-10000，避免 Qt int 溢出
+        scaled = int(cur / total * 10000) if total > 0 else 0
+        self.progress.setValue(scaled)
+        pct       = scaled / 100.0
+        total_str = PasswordCandidateGenerator._fmt_big(total)
+        self.progress.setFormat(f"{pct:.2f}%  （{cur:,} / {total_str}）")
+        self.status_lbl.setText(
+            f"{cur:,} / {total_str}"
+        )
 
     def _on_finished(self):
         self._elapsed_timer.stop()
-        elapsed = time.time() - self._attempt_start
+        elapsed   = time.time() - self._attempt_start
+        total_str = PasswordCandidateGenerator._fmt_big(self._attempt_total)
         self._log("", "info"); self._log("═" * 66, "info")
         self._log(f"[尝试结束]  {time.strftime('%Y-%m-%d %H:%M:%S')}", "info")
-        self._log(f"总耗时：{self._fmt_sec(elapsed)}", "info")
+        self._log(
+            f"总计尝试：{self._attempt_done:,} / {total_str}    "
+            f"总耗时：{self._fmt_sec(elapsed)}", "info"
+        )
         self._log("═" * 66, "info")
         for w in (self.btn_start, self.btn_direct,
                   self.ssid_combo, self.pwd_edit):
